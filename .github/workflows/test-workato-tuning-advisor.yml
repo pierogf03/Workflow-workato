@@ -1,0 +1,116 @@
+name: Test Workato Tuning Advisor
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_code:
+        description: "Project code: SOMOS BELCORP, PROL, or APESAT"
+        required: true
+        default: "APESAT"
+      database_name:
+        description: "Database name. For APESAT use APESAT."
+        required: true
+        default: "APESAT"
+      sql_query:
+        description: "SQL SELECT query to analyze"
+        required: true
+        default: "SELECT * FROM APESATQ.CBCUBIC2"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  call-workato-tuning-advisor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build request payload
+        run: |
+          mkdir -p reports
+
+          jq -n \
+            --arg project_code "${{ github.event.inputs.project_code }}" \
+            --arg database_name "${{ github.event.inputs.database_name }}" \
+            --arg sql_query "${{ github.event.inputs.sql_query }}" \
+            --arg repository "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg commit_sha "${{ github.sha }}" \
+            --arg run_id "${{ github.run_id }}" \
+            '{
+              project_code: $project_code,
+              database_name: $database_name,
+              sql_query: $sql_query,
+              repository: $repository,
+              branch: $branch,
+              commit_sha: $commit_sha,
+              run_id: $run_id,
+              source: "github_actions"
+            }' > reports/request.json
+
+          echo "Request payload:"
+          cat reports/request.json
+
+      - name: Call Workato endpoint
+        env:
+          WORKATO_TUNING_URL: ${{ secrets.WORKATO_TUNING_URL }}
+          WORKATO_API_TOKEN: ${{ secrets.WORKATO_API_TOKEN }}
+        run: |
+          if [ -z "$WORKATO_TUNING_URL" ]; then
+            echo "Missing secret WORKATO_TUNING_URL"
+            exit 1
+          fi
+
+          if [ -z "$WORKATO_API_TOKEN" ]; then
+            echo "Missing secret WORKATO_API_TOKEN"
+            exit 1
+          fi
+
+          HTTP_CODE=$(curl -sS \
+            -o reports/workato_response.json \
+            -w "%{http_code}" \
+            -X POST "$WORKATO_TUNING_URL" \
+            -H "API-TOKEN: $WORKATO_API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data @reports/request.json)
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Workato response:"
+          cat reports/workato_response.json
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "Workato endpoint call failed"
+            exit 1
+          fi
+
+      - name: Generate markdown report
+        run: |
+          echo "# Workato Tuning Advisor Report" > reports/tuning_report.md
+          echo "" >> reports/tuning_report.md
+          echo "**Repository:** ${{ github.repository }}" >> reports/tuning_report.md
+          echo "**Branch:** ${{ github.ref_name }}" >> reports/tuning_report.md
+          echo "**Commit:** ${{ github.sha }}" >> reports/tuning_report.md
+          echo "" >> reports/tuning_report.md
+
+          if jq -e '.report_markdown' reports/workato_response.json > /dev/null; then
+            jq -r '.report_markdown' reports/workato_response.json >> reports/tuning_report.md
+          elif jq -e '.result.report_markdown' reports/workato_response.json > /dev/null; then
+            jq -r '.result.report_markdown' reports/workato_response.json >> reports/tuning_report.md
+          else
+            echo "## Raw Workato response" >> reports/tuning_report.md
+            echo "" >> reports/tuning_report.md
+            echo '```json' >> reports/tuning_report.md
+            cat reports/workato_response.json >> reports/tuning_report.md
+            echo '```' >> reports/tuning_report.md
+          fi
+
+          cat reports/tuning_report.md
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: workato-tuning-advisor-report
+          path: reports/
