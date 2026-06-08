@@ -1,60 +1,75 @@
-name: Test Workato Tuning Advisor
+name: SQL Tuning Review with Workato Genie
 
 on:
-  workflow_dispatch:
-    inputs:
-      project_code:
-        description: "Project code: SOMOS BELCORP, PROL, or APESAT"
-        required: true
-        default: "APESAT"
-      database_name:
-        description: "Database name. For APESAT use APESAT."
-        required: true
-        default: "APESAT"
-      sql_query:
-        description: "SQL SELECT query to analyze"
-        required: true
-        default: "SELECT * FROM APESATQ.CBCUBIC2"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "**/*.sql"
+      - ".tuning-advisor.json"
 
 permissions:
   contents: read
-  actions: read
+  pull-requests: write
+  issues: write
 
 jobs:
-  call-workato-tuning-advisor:
+  sql-tuning-review:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout PR code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Build request payload
+      - name: Load tuning advisor config
         run: |
-          mkdir -p reports
+          mkdir -p reports/requests
+          mkdir -p reports/responses
 
-          jq -n \
-            --arg project_code "${{ github.event.inputs.project_code }}" \
-            --arg database_name "${{ github.event.inputs.database_name }}" \
-            --arg sql_query "${{ github.event.inputs.sql_query }}" \
-            --arg repository "${{ github.repository }}" \
-            --arg branch "${{ github.ref_name }}" \
-            --arg commit_sha "${{ github.sha }}" \
-            --arg run_id "${{ github.run_id }}" \
-            '{
-              project_code: $project_code,
-              database_name: $database_name,
-              sql_query: $sql_query,
-              repository: $repository,
-              branch: $branch,
-              commit_sha: $commit_sha,
-              run_id: $run_id,
-              source: "github_actions"
-            }' > reports/request.json
+          if [ ! -f ".tuning-advisor.json" ]; then
+            echo "Missing .tuning-advisor.json"
+            exit 1
+          fi
 
-          echo "Request payload:"
-          cat reports/request.json
+          PROJECT_CODE=$(jq -r '.project_code // empty' .tuning-advisor.json)
+          DATABASE_NAME=$(jq -r '.database_name // empty' .tuning-advisor.json)
 
-      - name: Call Workato endpoint
+          if [ -z "$PROJECT_CODE" ]; then
+            echo "project_code is missing in .tuning-advisor.json"
+            exit 1
+          fi
+
+          if [ -z "$DATABASE_NAME" ]; then
+            echo "database_name is missing in .tuning-advisor.json"
+            exit 1
+          fi
+
+          echo "PROJECT_CODE=$PROJECT_CODE" >> "$GITHUB_ENV"
+          echo "DATABASE_NAME=$DATABASE_NAME" >> "$GITHUB_ENV"
+
+          echo "Project code: $PROJECT_CODE"
+          echo "Database name: $DATABASE_NAME"
+
+      - name: Detect changed SQL files
+        run: |
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+            | grep -E '\.sql$' \
+            > reports/sql_files.txt || true
+
+          echo "SQL files detected:"
+          cat reports/sql_files.txt || true
+
+          if [ ! -s reports/sql_files.txt ]; then
+            echo "No SQL files changed."
+            exit 0
+          fi
+
+      - name: Call Workato Genie for each SQL file
         env:
           WORKATO_TUNING_URL: ${{ secrets.WORKATO_TUNING_URL }}
           WORKATO_API_TOKEN: ${{ secrets.WORKATO_API_TOKEN }}
@@ -69,48 +84,364 @@ jobs:
             exit 1
           fi
 
-          HTTP_CODE=$(curl -sS \
-            -o reports/workato_response.json \
-            -w "%{http_code}" \
-            -X POST "$WORKATO_TUNING_URL" \
-            -H "API-TOKEN: $WORKATO_API_TOKEN" \
-            -H "Content-Type: application/json" \
-            --data @reports/request.json)
+          COUNTER=0
 
-          echo "HTTP status: $HTTP_CODE"
-          echo "Workato response:"
-          cat reports/workato_response.json
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
 
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "Workato endpoint call failed"
+            COUNTER=$((COUNTER + 1))
+
+            echo "Analyzing SQL file: $file"
+
+            SAFE_NAME=$(echo "$file" | sed 's#[^a-zA-Z0-9._-]#_#g')
+            REQUEST_FILE="reports/requests/request_${COUNTER}_${SAFE_NAME}.json"
+            RESPONSE_FILE="reports/responses/response_${COUNTER}_${SAFE_NAME}.json"
+
+            jq -n \
+              --arg project_code "$PROJECT_CODE" \
+              --arg database_name "$DATABASE_NAME" \
+              --rawfile sql_query "$file" \
+              --arg file_path "$file" \
+              --arg repository "${{ github.repository }}" \
+              --arg branch "${{ github.head_ref }}" \
+              --arg commit_sha "${{ github.event.pull_request.head.sha }}" \
+              --arg pull_request_number "${{ github.event.pull_request.number }}" \
+              '{
+                project_code: $project_code,
+                database_name: $database_name,
+                sql_query: $sql_query,
+                file_path: $file_path,
+                repository: $repository,
+                branch: $branch,
+                commit_sha: $commit_sha,
+                pull_request_number: $pull_request_number,
+                source: "github_actions"
+              }' > "$REQUEST_FILE"
+
+            echo "Request file:"
+            cat "$REQUEST_FILE"
+
+            HTTP_CODE=$(curl -sS \
+              -o "$RESPONSE_FILE" \
+              -w "%{http_code}" \
+              -X POST "$WORKATO_TUNING_URL" \
+              -H "API-TOKEN: $WORKATO_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              --data @"$REQUEST_FILE")
+
+            echo "HTTP status for $file: $HTTP_CODE"
+
+            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+              echo "Workato API failed for $file"
+
+              RAW_RESPONSE=$(cat "$RESPONSE_FILE" || true)
+
+              jq -n \
+                --arg file_path "$file" \
+                --arg http_code "$HTTP_CODE" \
+                --arg raw_response "$RAW_RESPONSE" \
+                '{
+                  status: "error",
+                  file_path: $file_path,
+                  http_code: $http_code,
+                  report_markdown: "Workato endpoint call failed.",
+                  pipeline_result: {
+                    pipeline_continue: false,
+                    verdict: "NO PASA",
+                    total_score: 0,
+                    minimum_required_score: 80,
+                    critical_blockers: ["Workato endpoint call failed"],
+                    summary: "The Workato API call failed.",
+                    criteria: []
+                  },
+                  raw_response: $raw_response
+                }' > "$RESPONSE_FILE.tmp"
+
+              mv "$RESPONSE_FILE.tmp" "$RESPONSE_FILE"
+            fi
+
+          done < reports/sql_files.txt
+
+      - name: Build PR report from Workato responses
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const responsesDir = 'reports/responses';
+          const files = fs.existsSync(responsesDir)
+            ? fs.readdirSync(responsesDir).filter(f => f.endsWith('.json')).sort()
+            : [];
+
+          function readJson(filePath) {
+            const raw = fs.readFileSync(filePath, 'utf8');
+            try {
+              return JSON.parse(raw);
+            } catch (error) {
+              return {
+                status: 'error',
+                file_path: filePath,
+                report_markdown: 'Invalid JSON response from Workato.',
+                pipeline_result: {
+                  pipeline_continue: false,
+                  verdict: 'NO PASA',
+                  total_score: 0,
+                  minimum_required_score: 80,
+                  critical_blockers: ['Invalid JSON response from Workato'],
+                  summary: 'The response could not be parsed as JSON.',
+                  criteria: []
+                },
+                raw_response: raw
+              };
+            }
+          }
+
+          function extractText(response) {
+            if (typeof response === 'string') return response;
+
+            return (
+              response.report_markdown ||
+              response.result?.report_markdown ||
+              response.message ||
+              response.raw_genie_response ||
+              response.raw_response ||
+              JSON.stringify(response, null, 2)
+            );
+          }
+
+          function extractPipelineResult(response) {
+            if (response.pipeline_result && typeof response.pipeline_result === 'object') {
+              return response.pipeline_result;
+            }
+
+            if (response.result?.pipeline_result && typeof response.result.pipeline_result === 'object') {
+              return response.result.pipeline_result;
+            }
+
+            const text = extractText(response);
+
+            const patterns = [
+              /Pipeline JSON:\s*```json\s*([\s\S]*?)```/i,
+              /```json\s*({[\s\S]*?"pipeline_continue"[\s\S]*?})\s*```/i
+            ];
+
+            for (const pattern of patterns) {
+              const match = text.match(pattern);
+              if (match && match[1]) {
+                try {
+                  return JSON.parse(match[1].trim());
+                } catch (error) {
+                  return {
+                    pipeline_continue: false,
+                    verdict: 'NO PASA',
+                    total_score: 0,
+                    minimum_required_score: 80,
+                    critical_blockers: ['Pipeline JSON was found but could not be parsed'],
+                    summary: 'Pipeline JSON parse error.',
+                    criteria: []
+                  };
+                }
+              }
+            }
+
+            return {
+              pipeline_continue: false,
+              verdict: 'NO PASA',
+              total_score: 0,
+              minimum_required_score: 80,
+              critical_blockers: ['Pipeline JSON was not found in the API response'],
+              summary: 'No parseable Pipeline JSON was found.',
+              criteria: []
+            };
+          }
+
+          function removePipelineJsonFromMarkdown(markdown) {
+            if (!markdown) return '';
+            return markdown
+              .replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/i, '')
+              .trim();
+          }
+
+          const results = [];
+
+          for (const file of files) {
+            const fullPath = path.join(responsesDir, file);
+            const response = readJson(fullPath);
+
+            const pipeline = extractPipelineResult(response);
+            const reportMarkdown = extractText(response);
+
+            const filePath =
+              response.file_path ||
+              response.result?.file_path ||
+              file.replace(/^response_\d+_/, '');
+
+            results.push({
+              file_path: filePath,
+              status: response.status || response.result?.status || 'unknown',
+              report_markdown: reportMarkdown,
+              pipeline_result: pipeline,
+              raw_response: response
+            });
+          }
+
+          const failed = results.some(r => r.pipeline_result?.pipeline_continue !== true);
+
+          const marker = '<!-- workato-tuning-advisor-report -->';
+
+          let comment = `${marker}\n`;
+          comment += `# SQL Tuning Advisor\n\n`;
+          comment += `**Proyecto:** ${process.env.PROJECT_CODE || ''}  \n`;
+          comment += `**Base de datos:** ${process.env.DATABASE_NAME || ''}  \n`;
+          comment += `**Archivos analizados:** ${results.length}\n\n`;
+
+          comment += `## Resumen ejecutivo\n\n`;
+          comment += `| Archivo | Decisión | Puntaje | Continúa | Blockers |\n`;
+          comment += `|---|---|---:|---|---:|\n`;
+
+          for (const r of results) {
+            const p = r.pipeline_result || {};
+            const verdict = p.verdict || 'NO PASA';
+            const score = Number.isFinite(Number(p.total_score)) ? Number(p.total_score) : 0;
+            const cont = p.pipeline_continue === true ? 'SÍ' : 'NO';
+            const blockers = Array.isArray(p.critical_blockers) ? p.critical_blockers.length : 0;
+
+            comment += `| \`${r.file_path}\` | **${verdict}** | ${score}/100 | ${cont} | ${blockers} |\n`;
+          }
+
+          comment += `\n`;
+
+          for (const r of results) {
+            const p = r.pipeline_result || {};
+            const cleanReport = removePipelineJsonFromMarkdown(r.report_markdown);
+
+            comment += `---\n\n`;
+            comment += `## Archivo: \`${r.file_path}\`\n\n`;
+            comment += `**Decisión:** ${p.verdict || 'NO PASA'}  \n`;
+            comment += `**Puntaje:** ${p.total_score ?? 0}/${p.minimum_required_score ?? 80}  \n`;
+            comment += `**Continúa pipeline:** ${p.pipeline_continue === true ? 'SÍ' : 'NO'}  \n\n`;
+
+            if (p.summary) {
+              comment += `**Resumen:** ${p.summary}\n\n`;
+            }
+
+            if (Array.isArray(p.critical_blockers) && p.critical_blockers.length > 0) {
+              comment += `### Critical blockers\n\n`;
+              for (const blocker of p.critical_blockers) {
+                comment += `- ${blocker}\n`;
+              }
+              comment += `\n`;
+            }
+
+            if (Array.isArray(p.criteria) && p.criteria.length > 0) {
+              comment += `### Evaluación de criterios\n\n`;
+              comment += `| Criterio | Puntaje | Estado | Evidencia |\n`;
+              comment += `|---|---:|---|---|\n`;
+
+              for (const c of p.criteria) {
+                const evidence = String(c.evidence || '').replace(/\n/g, ' ');
+                comment += `| ${c.name || ''} | ${c.score ?? 0}/${c.max_score ?? ''} | ${c.status || ''} | ${evidence} |\n`;
+              }
+
+              comment += `\n`;
+            }
+
+            if (cleanReport) {
+              comment += `<details>\n`;
+              comment += `<summary>Ver análisis completo</summary>\n\n`;
+              comment += `${cleanReport}\n\n`;
+              comment += `</details>\n\n`;
+            }
+
+            comment += `<details>\n`;
+            comment += `<summary>Ver Pipeline JSON</summary>\n\n`;
+            comment += `\`\`\`json\n`;
+            comment += `${JSON.stringify(p, null, 2)}\n`;
+            comment += `\`\`\`\n\n`;
+            comment += `</details>\n\n`;
+          }
+
+          fs.writeFileSync('reports/aggregate_pipeline_result.json', JSON.stringify({
+            pipeline_continue: !failed,
+            verdict: failed ? 'NO PASA' : 'PASA',
+            project_code: process.env.PROJECT_CODE || '',
+            database_name: process.env.DATABASE_NAME || '',
+            files_analyzed: results.length,
+            results
+          }, null, 2));
+
+          fs.writeFileSync('reports/pr_comment.md', comment);
+          fs.writeFileSync('reports/should_fail.txt', failed ? 'true' : 'false');
+
+          console.log(comment);
+          NODE
+
+      - name: Add report to job summary
+        if: always()
+        run: |
+          if [ -f reports/pr_comment.md ]; then
+            cat reports/pr_comment.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Create or update PR comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const marker = '<!-- workato-tuning-advisor-report -->';
+
+            if (!fs.existsSync('reports/pr_comment.md')) {
+              core.info('No PR comment report found.');
+              return;
+            }
+
+            const body = fs.readFileSync('reports/pr_comment.md', 'utf8');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            const comments = await github.rest.issues.listComments({
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.data.find(comment =>
+              comment.body && comment.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Upload full tuning report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sql-tuning-advisor-report
+          path: reports/
+
+      - name: Fail workflow if quality gate does not pass
+        if: always()
+        run: |
+          if [ -f reports/should_fail.txt ] && [ "$(cat reports/should_fail.txt)" = "true" ]; then
+            echo "SQL tuning quality gate failed."
             exit 1
           fi
 
-      - name: Generate markdown report
-        run: |
-          echo "# Workato Tuning Advisor Report" > reports/tuning_report.md
-          echo "" >> reports/tuning_report.md
-          echo "**Repository:** ${{ github.repository }}" >> reports/tuning_report.md
-          echo "**Branch:** ${{ github.ref_name }}" >> reports/tuning_report.md
-          echo "**Commit:** ${{ github.sha }}" >> reports/tuning_report.md
-          echo "" >> reports/tuning_report.md
-
-          if jq -e '.report_markdown' reports/workato_response.json > /dev/null; then
-            jq -r '.report_markdown' reports/workato_response.json >> reports/tuning_report.md
-          elif jq -e '.result.report_markdown' reports/workato_response.json > /dev/null; then
-            jq -r '.result.report_markdown' reports/workato_response.json >> reports/tuning_report.md
-          else
-            echo "## Raw Workato response" >> reports/tuning_report.md
-            echo "" >> reports/tuning_report.md
-            echo '```json' >> reports/tuning_report.md
-            cat reports/workato_response.json >> reports/tuning_report.md
-            echo '```' >> reports/tuning_report.md
-          fi
-
-          cat reports/tuning_report.md
-
-      - name: Upload report artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: workato-tuning-advisor-report
-          path: reports/
+          echo "SQL tuning quality gate passed."
