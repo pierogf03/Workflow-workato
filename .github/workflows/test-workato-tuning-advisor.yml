@@ -2,10 +2,7 @@ name: SQL Tuning Review with Workato Genie
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - "**/*.sql"
-      - ".tuning-advisor.json"
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -16,6 +13,10 @@ jobs:
   sql-tuning-review:
     runs-on: ubuntu-latest
 
+    env:
+      PROJECT_CODE: "SOMOS BELCORP"
+      DATABASE_NAME: "BelcorpPeru"
+
     steps:
       - name: Checkout PR code
         uses: actions/checkout@v4
@@ -23,41 +24,21 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Load tuning advisor config
+      - name: Prepare report folders
         run: |
           mkdir -p reports/requests
           mkdir -p reports/responses
-
-          if [ ! -f ".tuning-advisor.json" ]; then
-            echo "Missing .tuning-advisor.json"
-            exit 1
-          fi
-
-          PROJECT_CODE=$(jq -r '.project_code // empty' .tuning-advisor.json)
-          DATABASE_NAME=$(jq -r '.database_name // empty' .tuning-advisor.json)
-
-          if [ -z "$PROJECT_CODE" ]; then
-            echo "project_code is missing in .tuning-advisor.json"
-            exit 1
-          fi
-
-          if [ -z "$DATABASE_NAME" ]; then
-            echo "database_name is missing in .tuning-advisor.json"
-            exit 1
-          fi
-
-          echo "PROJECT_CODE=$PROJECT_CODE" >> "$GITHUB_ENV"
-          echo "DATABASE_NAME=$DATABASE_NAME" >> "$GITHUB_ENV"
 
           echo "Project code: $PROJECT_CODE"
           echo "Database name: $DATABASE_NAME"
 
       - name: Detect changed SQL files
+        id: detect_sql
         run: |
           BASE_SHA="${{ github.event.pull_request.base.sha }}"
           HEAD_SHA="${{ github.event.pull_request.head.sha }}"
 
-          git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+          git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \
             | grep -E '\.sql$' \
             > reports/sql_files.txt || true
 
@@ -65,11 +46,42 @@ jobs:
           cat reports/sql_files.txt || true
 
           if [ ! -s reports/sql_files.txt ]; then
-            echo "No SQL files changed."
+            echo "has_sql=false" >> "$GITHUB_OUTPUT"
+
+            cat > reports/pr_comment.md <<EOF
+          <!-- workato-tuning-advisor-report -->
+          # SQL Tuning Advisor
+
+          **Proyecto:** $PROJECT_CODE  
+          **Base de datos:** $DATABASE_NAME  
+
+          No se detectaron archivos \`.sql\` modificados en este Pull Request.
+
+          **Resultado:** PASA  
+          **Motivo:** No hay archivos SQL para analizar.
+          EOF
+
+            echo "false" > reports/should_fail.txt
+
+            jq -n \
+              --arg project_code "$PROJECT_CODE" \
+              --arg database_name "$DATABASE_NAME" \
+              '{
+                pipeline_continue: true,
+                verdict: "PASA",
+                project_code: $project_code,
+                database_name: $database_name,
+                files_analyzed: 0,
+                results: []
+              }' > reports/aggregate_pipeline_result.json
+
             exit 0
           fi
 
+          echo "has_sql=true" >> "$GITHUB_OUTPUT"
+
       - name: Call Workato Genie for each SQL file
+        if: steps.detect_sql.outputs.has_sql == 'true'
         env:
           WORKATO_TUNING_URL: ${{ secrets.WORKATO_TUNING_URL }}
           WORKATO_API_TOKEN: ${{ secrets.WORKATO_API_TOKEN }}
@@ -118,9 +130,6 @@ jobs:
                 source: "github_actions"
               }' > "$REQUEST_FILE"
 
-            echo "Request file:"
-            cat "$REQUEST_FILE"
-
             HTTP_CODE=$(curl -sS \
               -o "$RESPONSE_FILE" \
               -w "%{http_code}" \
@@ -163,6 +172,7 @@ jobs:
           done < reports/sql_files.txt
 
       - name: Build PR report from Workato responses
+        if: steps.detect_sql.outputs.has_sql == 'true'
         run: |
           node <<'NODE'
           const fs = require('fs');
@@ -175,6 +185,7 @@ jobs:
 
           function readJson(filePath) {
             const raw = fs.readFileSync(filePath, 'utf8');
+
             try {
               return JSON.parse(raw);
             } catch (error) {
@@ -199,14 +210,27 @@ jobs:
           function extractText(response) {
             if (typeof response === 'string') return response;
 
+            if (typeof response.output === 'string') return response.output;
+            if (typeof response.final_response === 'string') return response.final_response;
+
             return (
               response.report_markdown ||
               response.result?.report_markdown ||
+              response.output?.report_markdown ||
               response.message ||
               response.raw_genie_response ||
               response.raw_response ||
               JSON.stringify(response, null, 2)
             );
+          }
+
+          function normalizeBoolean(value) {
+            if (value === true) return true;
+            if (value === false) return false;
+            if (typeof value === 'string') {
+              return value.toLowerCase().trim() === 'true';
+            }
+            return false;
           }
 
           function extractPipelineResult(response) {
@@ -218,6 +242,10 @@ jobs:
               return response.result.pipeline_result;
             }
 
+            if (response.output?.pipeline_result && typeof response.output.pipeline_result === 'object') {
+              return response.output.pipeline_result;
+            }
+
             const text = extractText(response);
 
             const patterns = [
@@ -227,6 +255,7 @@ jobs:
 
             for (const pattern of patterns) {
               const match = text.match(pattern);
+
               if (match && match[1]) {
                 try {
                   return JSON.parse(match[1].trim());
@@ -257,6 +286,7 @@ jobs:
 
           function removePipelineJsonFromMarkdown(markdown) {
             if (!markdown) return '';
+
             return markdown
               .replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/i, '')
               .trim();
@@ -274,25 +304,26 @@ jobs:
             const filePath =
               response.file_path ||
               response.result?.file_path ||
+              response.output?.file_path ||
               file.replace(/^response_\d+_/, '');
 
             results.push({
               file_path: filePath,
-              status: response.status || response.result?.status || 'unknown',
+              status: response.status || response.result?.status || response.output?.status || 'unknown',
               report_markdown: reportMarkdown,
               pipeline_result: pipeline,
               raw_response: response
             });
           }
 
-          const failed = results.some(r => r.pipeline_result?.pipeline_continue !== true);
+          const failed = results.some(r => normalizeBoolean(r.pipeline_result?.pipeline_continue) !== true);
 
           const marker = '<!-- workato-tuning-advisor-report -->';
 
           let comment = `${marker}\n`;
           comment += `# SQL Tuning Advisor\n\n`;
-          comment += `**Proyecto:** ${process.env.PROJECT_CODE || ''}  \n`;
-          comment += `**Base de datos:** ${process.env.DATABASE_NAME || ''}  \n`;
+          comment += `**Proyecto:** ${process.env.PROJECT_CODE || 'SOMOS BELCORP'}  \n`;
+          comment += `**Base de datos:** ${process.env.DATABASE_NAME || 'BelcorpPeru'}  \n`;
           comment += `**Archivos analizados:** ${results.length}\n\n`;
 
           comment += `## Resumen ejecutivo\n\n`;
@@ -303,7 +334,7 @@ jobs:
             const p = r.pipeline_result || {};
             const verdict = p.verdict || 'NO PASA';
             const score = Number.isFinite(Number(p.total_score)) ? Number(p.total_score) : 0;
-            const cont = p.pipeline_continue === true ? 'SÍ' : 'NO';
+            const cont = normalizeBoolean(p.pipeline_continue) ? 'SÍ' : 'NO';
             const blockers = Array.isArray(p.critical_blockers) ? p.critical_blockers.length : 0;
 
             comment += `| \`${r.file_path}\` | **${verdict}** | ${score}/100 | ${cont} | ${blockers} |\n`;
@@ -319,7 +350,7 @@ jobs:
             comment += `## Archivo: \`${r.file_path}\`\n\n`;
             comment += `**Decisión:** ${p.verdict || 'NO PASA'}  \n`;
             comment += `**Puntaje:** ${p.total_score ?? 0}/${p.minimum_required_score ?? 80}  \n`;
-            comment += `**Continúa pipeline:** ${p.pipeline_continue === true ? 'SÍ' : 'NO'}  \n\n`;
+            comment += `**Continúa pipeline:** ${normalizeBoolean(p.pipeline_continue) ? 'SÍ' : 'NO'}  \n\n`;
 
             if (p.summary) {
               comment += `**Resumen:** ${p.summary}\n\n`;
@@ -327,9 +358,11 @@ jobs:
 
             if (Array.isArray(p.critical_blockers) && p.critical_blockers.length > 0) {
               comment += `### Critical blockers\n\n`;
+
               for (const blocker of p.critical_blockers) {
                 comment += `- ${blocker}\n`;
               }
+
               comment += `\n`;
             }
 
@@ -364,8 +397,8 @@ jobs:
           fs.writeFileSync('reports/aggregate_pipeline_result.json', JSON.stringify({
             pipeline_continue: !failed,
             verdict: failed ? 'NO PASA' : 'PASA',
-            project_code: process.env.PROJECT_CODE || '',
-            database_name: process.env.DATABASE_NAME || '',
+            project_code: process.env.PROJECT_CODE || 'SOMOS BELCORP',
+            database_name: process.env.DATABASE_NAME || 'BelcorpPeru',
             files_analyzed: results.length,
             results
           }, null, 2));
