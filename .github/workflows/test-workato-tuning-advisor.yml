@@ -173,7 +173,7 @@ jobs:
 
           done < reports/sql_files.txt
 
-      - name: Build PR report from Workato responses
+            - name: Build PR report from Workato responses
         if: always()
         run: |
           node <<'NODE'
@@ -185,70 +185,180 @@ jobs:
             ? fs.readdirSync(responsesDir).filter(f => f.endsWith('.json')).sort()
             : [];
 
+          function tryParseJson(value) {
+            if (typeof value !== 'string') return value;
+
+            const trimmed = value.trim();
+
+            if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+              return value;
+            }
+
+            try {
+              return JSON.parse(trimmed);
+            } catch {
+              return value;
+            }
+          }
+
+          function deepUnwrap(response) {
+            let current = response;
+
+            if (typeof current === 'string') {
+              current = tryParseJson(current);
+            }
+
+            if (current && typeof current === 'object') {
+              const candidates = [
+                current.output,
+                current.result,
+                current.final_response,
+                current.finalResponse,
+                current.response,
+                current.genie_response,
+                current.raw_genie_response
+              ];
+
+              for (const candidate of candidates) {
+                const parsed = tryParseJson(candidate);
+
+                if (
+                  parsed &&
+                  typeof parsed === 'object' &&
+                  (
+                    parsed.report_markdown ||
+                    parsed.pipeline_result ||
+                    parsed.status ||
+                    parsed.summary
+                  )
+                ) {
+                  return parsed;
+                }
+              }
+            }
+
+            return current;
+          }
+
           function readJson(filePath) {
             const raw = fs.readFileSync(filePath, 'utf8');
 
             try {
-              return JSON.parse(raw);
-            } catch (error) {
-              return {
-                status: 'error',
-                file_path: filePath,
-                report_markdown: 'Invalid JSON response from Workato.',
-                pipeline_result: {
-                  pipeline_continue: false,
-                  verdict: 'NO PASA',
-                  total_score: 0,
-                  minimum_required_score: 80,
-                  critical_blockers: ['Invalid JSON response from Workato'],
-                  summary: 'The response could not be parsed as JSON.',
-                  criteria: []
-                },
-                raw_response: raw
-              };
+              const parsed = JSON.parse(raw);
+              return deepUnwrap(parsed);
+            } catch {
+              const parsedRaw = tryParseJson(raw);
+              return deepUnwrap(parsedRaw);
             }
-          }
-
-          function extractText(response) {
-            if (typeof response === 'string') return response;
-
-            if (typeof response.output === 'string') return response.output;
-            if (typeof response.final_response === 'string') return response.final_response;
-
-            return (
-              response.report_markdown ||
-              response.result?.report_markdown ||
-              response.output?.report_markdown ||
-              response.message ||
-              response.raw_genie_response ||
-              response.raw_response ||
-              JSON.stringify(response, null, 2)
-            );
           }
 
           function normalizeBoolean(value) {
             if (value === true) return true;
             if (value === false) return false;
+
             if (typeof value === 'string') {
               return value.toLowerCase().trim() === 'true';
             }
+
             return false;
           }
 
+          function decodeEscapedMarkdown(text) {
+            if (typeof text !== 'string') return '';
+
+            let result = text;
+
+            if (!result.includes('\n') && result.includes('\\n')) {
+              result = result
+                .replace(/\\r\\n/g, '\n')
+                .replace(/\\n/g, '\n')
+                .replace(/\\t/g, '  ');
+            }
+
+            return result;
+          }
+
+          function normalizeMarkdown(markdown) {
+            let text = decodeEscapedMarkdown(markdown || '');
+
+            text = text.replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/i, '').trim();
+
+            // Corrige bloques tipo:
+            // sql
+            // select ...
+            // para que GitHub los renderice como bloque de código.
+            text = text.replace(
+              /(^|\n)sql\n([\s\S]*?)(?=\n---|\n## |\n### |\n$)/gi,
+              function (_, prefix, code) {
+                return `${prefix}\`\`\`sql\n${code.trim()}\n\`\`\`\n\n`;
+              }
+            );
+
+            return text.trim();
+          }
+
+          function extractReportMarkdown(response) {
+            const unwrapped = deepUnwrap(response);
+
+            if (unwrapped && typeof unwrapped === 'object') {
+              const direct =
+                unwrapped.report_markdown ||
+                unwrapped.result?.report_markdown ||
+                unwrapped.output?.report_markdown;
+
+              if (direct) {
+                return normalizeMarkdown(direct);
+              }
+
+              // Si por alguna razón el objeto completo vino como texto en raw_genie_response,
+              // intenta parsearlo y extraer report_markdown.
+              const rawCandidates = [
+                unwrapped.raw_genie_response,
+                unwrapped.final_response,
+                unwrapped.output,
+                unwrapped.result
+              ];
+
+              for (const candidate of rawCandidates) {
+                const parsed = tryParseJson(candidate);
+
+                if (parsed && typeof parsed === 'object' && parsed.report_markdown) {
+                  return normalizeMarkdown(parsed.report_markdown);
+                }
+              }
+            }
+
+            if (typeof unwrapped === 'string') {
+              const parsed = tryParseJson(unwrapped);
+
+              if (parsed && typeof parsed === 'object' && parsed.report_markdown) {
+                return normalizeMarkdown(parsed.report_markdown);
+              }
+
+              return normalizeMarkdown(unwrapped);
+            }
+
+            return '';
+          }
+
           function extractPipelineResult(response) {
-            if (response.pipeline_result && typeof response.pipeline_result === 'object') {
-              return response.pipeline_result;
+            const unwrapped = deepUnwrap(response);
+
+            if (unwrapped && typeof unwrapped === 'object') {
+              if (unwrapped.pipeline_result && typeof unwrapped.pipeline_result === 'object') {
+                return unwrapped.pipeline_result;
+              }
+
+              if (unwrapped.result?.pipeline_result && typeof unwrapped.result.pipeline_result === 'object') {
+                return unwrapped.result.pipeline_result;
+              }
+
+              if (unwrapped.output?.pipeline_result && typeof unwrapped.output.pipeline_result === 'object') {
+                return unwrapped.output.pipeline_result;
+              }
             }
 
-            if (response.result?.pipeline_result && typeof response.result.pipeline_result === 'object') {
-              return response.result.pipeline_result;
-            }
-
-            if (response.output?.pipeline_result && typeof response.output.pipeline_result === 'object') {
-              return response.output.pipeline_result;
-            }
-
-            const text = extractText(response);
+            const text = extractReportMarkdown(response);
 
             const patterns = [
               /Pipeline JSON:\s*```json\s*([\s\S]*?)```/i,
@@ -261,7 +371,7 @@ jobs:
               if (match && match[1]) {
                 try {
                   return JSON.parse(match[1].trim());
-                } catch (error) {
+                } catch {
                   return {
                     pipeline_continue: false,
                     verdict: 'NO PASA',
@@ -284,14 +394,6 @@ jobs:
               summary: 'No parseable Pipeline JSON was found.',
               criteria: []
             };
-          }
-
-          function removePipelineJsonFromMarkdown(markdown) {
-            if (!markdown) return '';
-
-            return markdown
-              .replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/i, '')
-              .trim();
           }
 
           const marker = '<!-- workato-tuning-advisor-report -->';
@@ -330,17 +432,17 @@ jobs:
             const response = readJson(fullPath);
 
             const pipeline = extractPipelineResult(response);
-            const reportMarkdown = extractText(response);
+            const reportMarkdown = extractReportMarkdown(response);
 
             const filePath =
-              response.file_path ||
-              response.result?.file_path ||
-              response.output?.file_path ||
+              response?.file_path ||
+              response?.result?.file_path ||
+              response?.output?.file_path ||
               file.replace(/^response_\d+_/, '');
 
             results.push({
               file_path: filePath,
-              status: response.status || response.result?.status || response.output?.status || 'unknown',
+              status: response?.status || response?.result?.status || response?.output?.status || 'unknown',
               report_markdown: reportMarkdown,
               pipeline_result: pipeline,
               raw_response: response
@@ -373,7 +475,7 @@ jobs:
 
           for (const r of results) {
             const p = r.pipeline_result || {};
-            const cleanReport = removePipelineJsonFromMarkdown(r.report_markdown);
+            const cleanReport = r.report_markdown || '';
 
             comment += `---\n\n`;
             comment += `## Archivo: \`${r.file_path}\`\n\n`;
@@ -426,6 +528,7 @@ jobs:
           fs.writeFileSync('reports/pr_comment_full.md', comment);
 
           const maxLength = 60000;
+
           if (comment.length > maxLength) {
             comment = comment.slice(0, maxLength);
             comment += `\n\n---\n\n_Comentario truncado por tamaño. Revisa el artifact \`sql-tuning-advisor-report\` para ver el reporte completo._\n`;
