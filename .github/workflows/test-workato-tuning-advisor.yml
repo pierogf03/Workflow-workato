@@ -49,20 +49,6 @@ jobs:
 
           if [ ! -s reports/sql_files.txt ]; then
             echo "has_sql=false" >> "$GITHUB_OUTPUT"
-
-            cat > reports/pr_comment.md <<EOF
-          <!-- workato-tuning-advisor-report -->
-          # SQL Tuning Advisor
-
-          **Proyecto:** $PROJECT_CODE  
-          **Base de datos:** $DATABASE_NAME  
-
-          No se detectaron archivos \`.sql\` modificados en este Pull Request.
-
-          **Resultado:** PASA  
-          **Motivo:** No hay archivos SQL para analizar.
-          EOF
-
             echo "false" > reports/should_fail.txt
 
             jq -n \
@@ -155,7 +141,7 @@ jobs:
                   status: "error",
                   file_path: $file_path,
                   http_code: $http_code,
-                  report_markdown: "Workato endpoint call failed.",
+                  report_markdown: "## Error al llamar Workato\n\nNo se pudo obtener respuesta válida desde el endpoint de Workato.",
                   pipeline_result: {
                     pipeline_continue: false,
                     verdict: "NO PASA",
@@ -185,71 +171,172 @@ jobs:
             ? fs.readdirSync(responsesDir).filter(f => f.endsWith('.json')).sort()
             : [];
 
-          function tryParseJson(value) {
+          function safeJsonParse(value) {
             if (typeof value !== 'string') return value;
 
-            const trimmed = value.trim();
+            const text = value.trim();
 
-            if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
-              return value;
-            }
+            if (!text) return value;
 
             try {
-              return JSON.parse(trimmed);
+              return JSON.parse(text);
             } catch {
               return value;
             }
           }
 
-          function deepUnwrap(response) {
-            let current = response;
-
-            if (typeof current === 'string') {
-              current = tryParseJson(current);
+          function decodeJsonStringLiteral(literalContent) {
+            try {
+              return JSON.parse(`"${literalContent}"`);
+            } catch {
+              return literalContent
+                .replace(/\\r\\n/g, '\n')
+                .replace(/\\n/g, '\n')
+                .replace(/\\t/g, '  ')
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\');
             }
+          }
 
-            if (current && typeof current === 'object') {
-              const candidates = [
-                current.output,
-                current.result,
-                current.final_response,
-                current.finalResponse,
-                current.response,
-                current.genie_response,
-                current.raw_genie_response
-              ];
+          function extractStringFieldFromRaw(rawText, fieldName) {
+            if (typeof rawText !== 'string') return '';
 
-              for (const candidate of candidates) {
-                const parsed = tryParseJson(candidate);
+            const regex = new RegExp(`"${fieldName}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, 's');
+            const match = rawText.match(regex);
 
-                if (
-                  parsed &&
-                  typeof parsed === 'object' &&
-                  (
-                    parsed.report_markdown ||
-                    parsed.pipeline_result ||
-                    parsed.status ||
-                    parsed.summary
-                  )
-                ) {
-                  return parsed;
+            if (!match) return '';
+
+            return decodeJsonStringLiteral(match[1]);
+          }
+
+          function extractJsonObjectAfterKey(rawText, keyName) {
+            if (typeof rawText !== 'string') return null;
+
+            const keyIndex = rawText.indexOf(`"${keyName}"`);
+
+            if (keyIndex === -1) return null;
+
+            const colonIndex = rawText.indexOf(':', keyIndex);
+
+            if (colonIndex === -1) return null;
+
+            const startIndex = rawText.indexOf('{', colonIndex);
+
+            if (startIndex === -1) return null;
+
+            let depth = 0;
+            let inString = false;
+            let escaped = false;
+
+            for (let i = startIndex; i < rawText.length; i++) {
+              const ch = rawText[i];
+
+              if (escaped) {
+                escaped = false;
+                continue;
+              }
+
+              if (ch === '\\') {
+                escaped = true;
+                continue;
+              }
+
+              if (ch === '"') {
+                inString = !inString;
+                continue;
+              }
+
+              if (inString) continue;
+
+              if (ch === '{') depth++;
+              if (ch === '}') depth--;
+
+              if (depth === 0) {
+                const candidate = rawText.slice(startIndex, i + 1);
+                try {
+                  return JSON.parse(candidate);
+                } catch {
+                  return null;
                 }
               }
             }
 
-            return current;
+            return null;
           }
 
-          function readJson(filePath) {
-            const raw = fs.readFileSync(filePath, 'utf8');
+          function recursivelyFindStructuredObject(value, depth = 0) {
+            if (depth > 8 || value === null || value === undefined) return null;
 
-            try {
-              const parsed = JSON.parse(raw);
-              return deepUnwrap(parsed);
-            } catch {
-              const parsedRaw = tryParseJson(raw);
-              return deepUnwrap(parsedRaw);
+            const parsed = safeJsonParse(value);
+
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              if (
+                parsed.report_markdown ||
+                parsed.pipeline_result ||
+                parsed.status ||
+                parsed.summary
+              ) {
+                return parsed;
+              }
+
+              for (const key of Object.keys(parsed)) {
+                const found = recursivelyFindStructuredObject(parsed[key], depth + 1);
+
+                if (found) return found;
+              }
             }
+
+            if (typeof parsed === 'string') {
+              const reportMarkdown = extractStringFieldFromRaw(parsed, 'report_markdown');
+              const pipelineResult = extractJsonObjectAfterKey(parsed, 'pipeline_result');
+
+              if (reportMarkdown || pipelineResult) {
+                return {
+                  report_markdown: reportMarkdown,
+                  pipeline_result: pipelineResult || undefined,
+                  raw_text: parsed
+                };
+              }
+            }
+
+            return null;
+          }
+
+          function readResponse(filePath) {
+            const raw = fs.readFileSync(filePath, 'utf8');
+            const parsed = safeJsonParse(raw);
+            const structured = recursivelyFindStructuredObject(parsed);
+
+            if (structured) {
+              structured.__raw_response_text = raw;
+              return structured;
+            }
+
+            const reportMarkdown = extractStringFieldFromRaw(raw, 'report_markdown');
+            const pipelineResult = extractJsonObjectAfterKey(raw, 'pipeline_result');
+
+            if (reportMarkdown || pipelineResult) {
+              return {
+                report_markdown: reportMarkdown,
+                pipeline_result: pipelineResult || undefined,
+                __raw_response_text: raw
+              };
+            }
+
+            return {
+              status: 'error',
+              report_markdown: '## Respuesta no estructurada\n\nNo se pudo extraer `report_markdown` desde la respuesta de Workato.',
+              pipeline_result: {
+                pipeline_continue: false,
+                verdict: 'NO PASA',
+                total_score: 0,
+                minimum_required_score: 80,
+                critical_blockers: ['Could not extract report_markdown from Workato response'],
+                summary: 'The response could not be parsed as the expected structure.',
+                criteria: []
+              },
+              __raw_response_text: raw
+            };
           }
 
           function normalizeBoolean(value) {
@@ -281,11 +368,23 @@ jobs:
           function normalizeMarkdown(markdown) {
             let text = decodeEscapedMarkdown(markdown || '');
 
-            text = text.replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/i, '').trim();
+            text = text
+              .replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/gi, '')
+              .replace(/"pipeline_result"\s*:\s*\{[\s\S]*$/i, '')
+              .replace(/,\s*"raw_notes"\s*:\s*"[\s\S]*$/i, '')
+              .trim();
 
             text = text.replace(
-              /(^|\n)sql\n([\s\S]*?)(?=\n---|\n## |\n### |\n$)/gi,
+              /(^|\n)sql\n([\s\S]*?)(?=\n---|\n## |\n### |\n\d+\.\s|\n$)/gi,
               function (_, prefix, code) {
+                return `${prefix}\`\`\`sql\n${code.trim()}\n\`\`\`\n\n`;
+              }
+            );
+
+            text = text.replace(
+              /(^|\n)(select\s+[\s\S]*?)(?=\n---|\n## |\n### |\n\d+\.\s|\n$)/gi,
+              function (_, prefix, code) {
+                if (code.trim().startsWith('```')) return `${prefix}${code}`;
                 return `${prefix}\`\`\`sql\n${code.trim()}\n\`\`\`\n\n`;
               }
             );
@@ -294,88 +393,59 @@ jobs:
           }
 
           function extractReportMarkdown(response) {
-            const unwrapped = deepUnwrap(response);
-
-            if (unwrapped && typeof unwrapped === 'object') {
-              const direct =
-                unwrapped.report_markdown ||
-                unwrapped.result?.report_markdown ||
-                unwrapped.output?.report_markdown;
-
-              if (direct) {
-                return normalizeMarkdown(direct);
+            if (response && typeof response === 'object') {
+              if (typeof response.report_markdown === 'string') {
+                return normalizeMarkdown(response.report_markdown);
               }
 
-              const rawCandidates = [
-                unwrapped.raw_genie_response,
-                unwrapped.final_response,
-                unwrapped.output,
-                unwrapped.result
-              ];
-
-              for (const candidate of rawCandidates) {
-                const parsed = tryParseJson(candidate);
+              if (typeof response.raw_genie_response === 'string') {
+                const parsed = safeJsonParse(response.raw_genie_response);
 
                 if (parsed && typeof parsed === 'object' && parsed.report_markdown) {
                   return normalizeMarkdown(parsed.report_markdown);
                 }
+
+                const extracted = extractStringFieldFromRaw(response.raw_genie_response, 'report_markdown');
+
+                if (extracted) {
+                  return normalizeMarkdown(extracted);
+                }
+              }
+
+              if (typeof response.__raw_response_text === 'string') {
+                const extracted = extractStringFieldFromRaw(response.__raw_response_text, 'report_markdown');
+
+                if (extracted) {
+                  return normalizeMarkdown(extracted);
+                }
               }
             }
 
-            if (typeof unwrapped === 'string') {
-              const parsed = tryParseJson(unwrapped);
-
-              if (parsed && typeof parsed === 'object' && parsed.report_markdown) {
-                return normalizeMarkdown(parsed.report_markdown);
-              }
-
-              return normalizeMarkdown(unwrapped);
-            }
-
-            return '';
+            return '## Análisis no disponible\n\nNo se pudo extraer el campo `report_markdown` desde la respuesta de Workato.';
           }
 
           function extractPipelineResult(response) {
-            const unwrapped = deepUnwrap(response);
-
-            if (unwrapped && typeof unwrapped === 'object') {
-              if (unwrapped.pipeline_result && typeof unwrapped.pipeline_result === 'object') {
-                return unwrapped.pipeline_result;
+            if (response && typeof response === 'object') {
+              if (response.pipeline_result && typeof response.pipeline_result === 'object') {
+                return response.pipeline_result;
               }
 
-              if (unwrapped.result?.pipeline_result && typeof unwrapped.result.pipeline_result === 'object') {
-                return unwrapped.result.pipeline_result;
-              }
+              if (typeof response.raw_genie_response === 'string') {
+                const parsed = safeJsonParse(response.raw_genie_response);
 
-              if (unwrapped.output?.pipeline_result && typeof unwrapped.output.pipeline_result === 'object') {
-                return unwrapped.output.pipeline_result;
-              }
-            }
-
-            const text = extractReportMarkdown(response);
-
-            const patterns = [
-              /Pipeline JSON:\s*```json\s*([\s\S]*?)```/i,
-              /```json\s*({[\s\S]*?"pipeline_continue"[\s\S]*?})\s*```/i
-            ];
-
-            for (const pattern of patterns) {
-              const match = text.match(pattern);
-
-              if (match && match[1]) {
-                try {
-                  return JSON.parse(match[1].trim());
-                } catch {
-                  return {
-                    pipeline_continue: false,
-                    verdict: 'NO PASA',
-                    total_score: 0,
-                    minimum_required_score: 80,
-                    critical_blockers: ['Pipeline JSON was found but could not be parsed'],
-                    summary: 'Pipeline JSON parse error.',
-                    criteria: []
-                  };
+                if (parsed && typeof parsed === 'object' && parsed.pipeline_result) {
+                  return parsed.pipeline_result;
                 }
+
+                const extracted = extractJsonObjectAfterKey(response.raw_genie_response, 'pipeline_result');
+
+                if (extracted) return extracted;
+              }
+
+              if (typeof response.__raw_response_text === 'string') {
+                const extracted = extractJsonObjectAfterKey(response.__raw_response_text, 'pipeline_result');
+
+                if (extracted) return extracted;
               }
             }
 
@@ -388,6 +458,16 @@ jobs:
               summary: 'No parseable Pipeline JSON was found.',
               criteria: []
             };
+          }
+
+          function compactSummary(text, maxLength = 450) {
+            if (!text) return '';
+
+            const clean = String(text).replace(/\s+/g, ' ').trim();
+
+            if (clean.length <= maxLength) return clean;
+
+            return clean.slice(0, maxLength - 3) + '...';
           }
 
           const marker = '<!-- workato-tuning-advisor-report -->';
@@ -423,20 +503,20 @@ jobs:
 
           for (const file of files) {
             const fullPath = path.join(responsesDir, file);
-            const response = readJson(fullPath);
+            const response = readResponse(fullPath);
 
             const pipeline = extractPipelineResult(response);
             const reportMarkdown = extractReportMarkdown(response);
 
             const filePath =
-              response?.file_path ||
-              response?.result?.file_path ||
-              response?.output?.file_path ||
+              response.file_path ||
+              response.result?.file_path ||
+              response.output?.file_path ||
               file.replace(/^response_\d+_/, '');
 
             results.push({
               file_path: filePath,
-              status: response?.status || response?.result?.status || response?.output?.status || 'unknown',
+              status: response.status || 'unknown',
               report_markdown: reportMarkdown,
               pipeline_result: pipeline,
               raw_response: response
@@ -459,26 +539,29 @@ jobs:
             const p = r.pipeline_result || {};
             const verdict = p.verdict || 'NO PASA';
             const score = Number.isFinite(Number(p.total_score)) ? Number(p.total_score) : 0;
+            const minScore = Number.isFinite(Number(p.minimum_required_score)) ? Number(p.minimum_required_score) : 80;
             const cont = normalizeBoolean(p.pipeline_continue) ? 'SÍ' : 'NO';
             const blockers = Array.isArray(p.critical_blockers) ? p.critical_blockers.length : 0;
 
-            comment += `| \`${r.file_path}\` | **${verdict}** | ${score}/100 | ${cont} | ${blockers} |\n`;
+            comment += `| \`${r.file_path}\` | **${verdict}** | ${score}/${minScore} | ${cont} | ${blockers} |\n`;
           }
 
           comment += `\n`;
 
           for (const r of results) {
             const p = r.pipeline_result || {};
+            const score = Number.isFinite(Number(p.total_score)) ? Number(p.total_score) : 0;
+            const minScore = Number.isFinite(Number(p.minimum_required_score)) ? Number(p.minimum_required_score) : 80;
             const cleanReport = r.report_markdown || '';
 
             comment += `---\n\n`;
             comment += `## Archivo: \`${r.file_path}\`\n\n`;
             comment += `**Decisión:** ${p.verdict || 'NO PASA'}  \n`;
-            comment += `**Puntaje:** ${p.total_score ?? 0}/${p.minimum_required_score ?? 80}  \n`;
+            comment += `**Puntaje:** ${score}/${minScore}  \n`;
             comment += `**Continúa pipeline:** ${normalizeBoolean(p.pipeline_continue) ? 'SÍ' : 'NO'}  \n\n`;
 
             if (p.summary) {
-              comment += `**Resumen:** ${p.summary}\n\n`;
+              comment += `> ${compactSummary(p.summary)}\n\n`;
             }
 
             if (Array.isArray(p.critical_blockers) && p.critical_blockers.length > 0) {
@@ -506,13 +589,13 @@ jobs:
 
             if (cleanReport) {
               comment += `<details>\n`;
-              comment += `<summary>Ver análisis completo</summary>\n\n`;
+              comment += `<summary><strong>Ver análisis completo</strong></summary>\n\n`;
               comment += `${cleanReport}\n\n`;
               comment += `</details>\n\n`;
             }
 
             comment += `<details>\n`;
-            comment += `<summary>Ver Pipeline JSON</summary>\n\n`;
+            comment += `<summary><strong>Ver Pipeline JSON</strong></summary>\n\n`;
             comment += `\`\`\`json\n`;
             comment += `${JSON.stringify(p, null, 2)}\n`;
             comment += `\`\`\`\n\n`;
