@@ -173,7 +173,7 @@ jobs:
 
           done < reports/sql_files.txt
 
-            - name: Build PR report from Workato responses
+      - name: Build PR report from Workato responses
         if: always()
         run: |
           node <<'NODE'
@@ -283,10 +283,6 @@ jobs:
 
             text = text.replace(/Pipeline JSON:\s*```json\s*[\s\S]*?```/i, '').trim();
 
-            // Corrige bloques tipo:
-            // sql
-            // select ...
-            // para que GitHub los renderice como bloque de código.
             text = text.replace(
               /(^|\n)sql\n([\s\S]*?)(?=\n---|\n## |\n### |\n$)/gi,
               function (_, prefix, code) {
@@ -310,8 +306,6 @@ jobs:
                 return normalizeMarkdown(direct);
               }
 
-              // Si por alguna razón el objeto completo vino como texto en raw_genie_response,
-              // intenta parsearlo y extraer report_markdown.
               const rawCandidates = [
                 unwrapped.raw_genie_response,
                 unwrapped.final_response,
