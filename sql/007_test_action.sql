@@ -1,0 +1,7 @@
+SELECT DISTINCT TOP 100 *
+FROM dbo.PedidoWeb p
+WHERE CAST(p.CampaniaID AS VARCHAR(20)) = '202417'
+   OR ISNULL(p.ConsultoraID, 0) = 42727
+   OR CONVERT(VARCHAR(10), p.FechaRegistro, 120) = '2026-06-07'
+   OR CAST(p.ImporteTotal AS VARCHAR(30)) LIKE '%44%'
+ORDER BY NEWID();
