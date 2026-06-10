@@ -16,6 +16,7 @@ jobs:
     env:
       PROJECT_CODE: "SOMOS BELCORP"
       DATABASE_NAME: "BelcorpPeru"
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout PR code
@@ -31,6 +32,7 @@ jobs:
 
           echo "Project code: $PROJECT_CODE"
           echo "Database name: $DATABASE_NAME"
+          echo "Pull request number: ${{ github.event.pull_request.number }}"
 
       - name: Detect changed SQL files
         id: detect_sql
@@ -172,7 +174,7 @@ jobs:
           done < reports/sql_files.txt
 
       - name: Build PR report from Workato responses
-        if: steps.detect_sql.outputs.has_sql == 'true'
+        if: always()
         run: |
           node <<'NODE'
           const fs = require('fs');
@@ -292,6 +294,35 @@ jobs:
               .trim();
           }
 
+          const marker = '<!-- workato-tuning-advisor-report -->';
+
+          if (files.length === 0) {
+            const comment = `${marker}
+          # SQL Tuning Advisor
+
+          **Proyecto:** ${process.env.PROJECT_CODE || 'SOMOS BELCORP'}  
+          **Base de datos:** ${process.env.DATABASE_NAME || 'BelcorpPeru'}  
+
+          No se detectaron archivos \`.sql\` modificados o no se generaron respuestas desde Workato.
+
+          **Resultado:** PASA
+          `;
+
+            fs.writeFileSync('reports/pr_comment.md', comment);
+            fs.writeFileSync('reports/should_fail.txt', 'false');
+            fs.writeFileSync('reports/aggregate_pipeline_result.json', JSON.stringify({
+              pipeline_continue: true,
+              verdict: 'PASA',
+              project_code: process.env.PROJECT_CODE || 'SOMOS BELCORP',
+              database_name: process.env.DATABASE_NAME || 'BelcorpPeru',
+              files_analyzed: 0,
+              results: []
+            }, null, 2));
+
+            console.log(comment);
+            process.exit(0);
+          }
+
           const results = [];
 
           for (const file of files) {
@@ -317,8 +348,6 @@ jobs:
           }
 
           const failed = results.some(r => normalizeBoolean(r.pipeline_result?.pipeline_continue) !== true);
-
-          const marker = '<!-- workato-tuning-advisor-report -->';
 
           let comment = `${marker}\n`;
           comment += `# SQL Tuning Advisor\n\n`;
@@ -394,6 +423,16 @@ jobs:
             comment += `</details>\n\n`;
           }
 
+          fs.writeFileSync('reports/pr_comment_full.md', comment);
+
+          const maxLength = 60000;
+          if (comment.length > maxLength) {
+            comment = comment.slice(0, maxLength);
+            comment += `\n\n---\n\n_Comentario truncado por tamaño. Revisa el artifact \`sql-tuning-advisor-report\` para ver el reporte completo._\n`;
+          }
+
+          fs.writeFileSync('reports/pr_comment.md', comment);
+
           fs.writeFileSync('reports/aggregate_pipeline_result.json', JSON.stringify({
             pipeline_continue: !failed,
             verdict: failed ? 'NO PASA' : 'PASA',
@@ -403,7 +442,6 @@ jobs:
             results
           }, null, 2));
 
-          fs.writeFileSync('reports/pr_comment.md', comment);
           fs.writeFileSync('reports/should_fail.txt', failed ? 'true' : 'false');
 
           console.log(comment);
@@ -414,6 +452,8 @@ jobs:
         run: |
           if [ -f reports/pr_comment.md ]; then
             cat reports/pr_comment.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No reports/pr_comment.md found" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Create or update PR comment
@@ -425,15 +465,25 @@ jobs:
 
             const marker = '<!-- workato-tuning-advisor-report -->';
 
+            if (!context.payload.pull_request) {
+              core.setFailed('This workflow was not triggered by a pull_request event.');
+              return;
+            }
+
             if (!fs.existsSync('reports/pr_comment.md')) {
-              core.info('No PR comment report found.');
+              core.setFailed('reports/pr_comment.md was not found.');
               return;
             }
 
             const body = fs.readFileSync('reports/pr_comment.md', 'utf8');
 
+            core.info(`Comment length: ${body.length}`);
+
             const { owner, repo } = context.repo;
             const issue_number = context.payload.pull_request.number;
+
+            core.info(`Repository: ${owner}/${repo}`);
+            core.info(`Pull request: ${issue_number}`);
 
             const comments = await github.rest.issues.listComments({
               owner,
@@ -447,19 +497,23 @@ jobs:
             );
 
             if (existing) {
+              core.info(`Updating existing comment: ${existing.id}`);
               await github.rest.issues.updateComment({
                 owner,
                 repo,
                 comment_id: existing.id,
                 body
               });
+              core.info('PR comment updated successfully.');
             } else {
-              await github.rest.issues.createComment({
+              core.info('Creating new PR comment.');
+              const created = await github.rest.issues.createComment({
                 owner,
                 repo,
                 issue_number,
                 body
               });
+              core.info(`PR comment created successfully: ${created.data.html_url}`);
             }
 
       - name: Upload full tuning report
