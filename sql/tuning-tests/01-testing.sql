@@ -1,1 +1,0 @@
-select * from ods.consultora where consultoraId='15434149'
